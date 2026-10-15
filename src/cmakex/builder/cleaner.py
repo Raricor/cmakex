@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
+from ..introspect import ANALYSIS_DIR_NAME
+
 
 @dataclass
 class CleanInfo:
@@ -92,6 +94,9 @@ class Cleaner:
 
         for root, dirs, filenames in os.walk(self.build_dir):
             root_path = Path(root)
+            if root_path == self.build_dir:
+                # The analysis trees are not touched by the clean target.
+                dirs[:] = [d for d in dirs if d != ANALYSIS_DIR_NAME]
 
             # Check for special directories (CMakeFiles, *.dir)
             for dir_pattern in dir_patterns:
