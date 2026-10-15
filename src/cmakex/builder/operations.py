@@ -5,7 +5,13 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
+
+from ..fileapi import write_query
+
+#: Runs a command and returns its exit code. The default inherits the
+#: terminal; the interactive UI passes one that captures output.
+Runner = Callable[[List[str]], int]
 
 
 def _cmake() -> str:
@@ -18,18 +24,31 @@ def _cmake() -> str:
     return exe
 
 
+def _run(cmd: List[str], verbose: bool, runner: Optional[Runner]) -> int:
+    if runner is not None:
+        return runner(cmd)
+    if verbose:
+        print(f"$ {' '.join(cmd)}")
+    return subprocess.run(cmd).returncode
+
+
 def configure(
     source_dir: Path,
     build_dir: Path,
     generator: Optional[str] = None,
     cmake_args: Optional[List[str]] = None,
     verbose: bool = False,
+    runner: Optional[Runner] = None,
 ) -> int:
     """Create *build_dir* and run ``cmake -S source_dir -B build_dir [args]``.
+
+    Also queries the CMake File API so ``cmakex info`` can read exact
+    results without re-running configure.
 
     Returns the cmake process exit code.
     """
     build_dir.mkdir(parents=True, exist_ok=True)
+    write_query(build_dir)
     cmake = _cmake()
 
     cmd: List[str] = [cmake, "-S", str(source_dir), "-B", str(build_dir)]
@@ -38,10 +57,7 @@ def configure(
     if cmake_args:
         cmd += cmake_args
 
-    if verbose:
-        print(f"$ {' '.join(cmd)}")
-
-    return subprocess.run(cmd).returncode
+    return _run(cmd, verbose, runner)
 
 
 def build(
@@ -51,6 +67,7 @@ def build(
     config: Optional[str] = None,
     extra_args: Optional[List[str]] = None,
     verbose: bool = False,
+    runner: Optional[Runner] = None,
 ) -> int:
     """Run ``cmake --build build_dir [options]``.
 
@@ -68,13 +85,12 @@ def build(
     if extra_args:
         cmd += ["--", *extra_args]
 
-    if verbose:
-        print(f"$ {' '.join(cmd)}")
-
-    return subprocess.run(cmd).returncode
+    return _run(cmd, verbose, runner)
 
 
-def clean(build_dir: Path, verbose: bool = False) -> int:
+def clean(
+    build_dir: Path, verbose: bool = False, runner: Optional[Runner] = None
+) -> int:
     """Run ``cmake --build build_dir --target clean``.
 
     Returns the cmake process exit code.
@@ -82,10 +98,7 @@ def clean(build_dir: Path, verbose: bool = False) -> int:
     cmake = _cmake()
     cmd = [cmake, "--build", str(build_dir), "--target", "clean"]
 
-    if verbose:
-        print(f"$ {' '.join(cmd)}")
-
-    return subprocess.run(cmd).returncode
+    return _run(cmd, verbose, runner)
 
 
 def install(
@@ -95,6 +108,7 @@ def install(
     component: Optional[str] = None,
     strip: bool = False,
     verbose: bool = False,
+    runner: Optional[Runner] = None,
 ) -> int:
     """Run ``cmake --install build_dir [options]``.
 
@@ -112,10 +126,7 @@ def install(
     if strip:
         cmd.append("--strip")
 
-    if verbose:
-        print(f"$ {' '.join(cmd)}")
-
-    return subprocess.run(cmd).returncode
+    return _run(cmd, verbose, runner)
 
 
 def uninstall(build_dir: Path, verbose: bool = False) -> int:
