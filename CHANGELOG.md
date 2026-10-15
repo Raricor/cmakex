@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first configure preset, or with CMake defaults and Debug when there are no
   presets. Results follow `if()`, functions and `find_package()` exactly as
   CMake evaluates them.
+- `cmakex clean` also uninstalls what `cmakex install` installed, using
+  `install_manifest.txt`; the installed files are listed in its confirmation.
 - `cmakex info --preset`, `--backend auto|file-api|static` and `--config`
   (for multi-config generators); `cmakex configure --preset`.
 - Change detection by content. After each analysis, cmakex records the MD5
@@ -74,7 +76,7 @@ Static parsing, now the fallback, gives correct results for common projects:
   are skipped; `IMPORTED` libraries with a type are no longer listed as
   targets.
 
-## [0.1.0] - 2026-06-06
+## [0.1.0] - 2026-04-15
 
 ### Added
 
@@ -83,8 +85,7 @@ Static parsing, now the fallback, gives correct results for common projects:
 - `cmakex configure`, `cmakex build` (alias `compile`) and `cmakex install`,
   wrapping `cmake -S/-B`, `cmake --build` and `cmake --install`.
 - `cmakex clean`: lists what will be removed and asks first (`-y` skips the
-  question); also uninstalls the files listed in `install_manifest.txt`.
-  `--purge` removes the whole build directory.
+  question); `--purge` removes the whole build directory.
 
 [0.2.0]: https://github.com/Raricor/cmakex/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Raricor/cmakex/releases/tag/v0.1.0
