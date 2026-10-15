@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from . import process
 from .fileapi import MIN_CMAKE_VERSION, FileApiError, Reply, supports_file_api, write_query
 from .inputs import SNAPSHOT_NAME, InputSnapshot, describe_changes, file_state
 from .models import CMakeInfo
@@ -293,18 +294,20 @@ def _configure(
 
     tail: deque = deque(maxlen=10)
     # cwd matters for --preset, which reads the presets of the cwd.
-    proc = subprocess.Popen(
-        [cmake, *args],
-        cwd=source_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    proc = process.spawn([cmake, *args], cwd=source_dir)
     assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip()
-        tail.append(line)
-        on_output(line)
-    if proc.wait() != 0:
+    try:
+        for line in proc.stdout:
+            line = line.rstrip()
+            tail.append(line)
+            on_output(line)
+    except BaseException:
+        # E.g. Ctrl+C during `cmakex info`: CMake runs in its own session,
+        # so the terminal's SIGINT did not reach it.
+        process.stop(proc)
+        raise
+    finally:
+        rc = process.finish(proc)
+    if rc != 0:
         lines = "\n".join(f"  {line}" for line in tail)
         raise FileApiError(f"CMake configure failed:\n{lines}")

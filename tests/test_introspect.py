@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from cmakex import introspect
+from cmakex import introspect, process
 from cmakex.builder import Cleaner, configure
 from cmakex.fileapi import Reply
 from cmakex.inputs import SNAPSHOT_NAME, InputSnapshot
@@ -315,3 +315,26 @@ def test_clean_ignores_analysis_trees(project):
     listed = [*targets.directories, *targets.files]
     assert listed
     assert not any(ANALYSIS_DIR_NAME in p.parts for p in listed)
+
+
+def test_interrupt_stops_cmake(tmp_path):
+    # Ctrl+C during `cmakex info` must not leave CMake running: it has its
+    # own session, so the terminal's SIGINT does not reach it.
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.14)\n"
+        "project(slow LANGUAGES NONE)\n"
+        'message(STATUS "started")\n'
+        "execute_process(COMMAND sleep 30)\n"
+    )
+
+    def interrupt(line: str) -> None:
+        if "started" in line:
+            raise KeyboardInterrupt
+
+    start = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        inspect_project(src, tmp_path / "build", on_output=interrupt)
+    assert time.monotonic() - start < 10
+    assert not process._running
