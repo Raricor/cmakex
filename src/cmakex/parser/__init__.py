@@ -4,7 +4,7 @@ This package provides functionality to parse CMakeLists.txt files and
 extract build information.
 """
 
-from .models import CMakeInfo, ExecutableInfo, LibraryInfo
+from ..models import CMakeInfo, ExecutableInfo, LibraryInfo
 from .parser import parse_cmake_file
 
 __all__ = [
