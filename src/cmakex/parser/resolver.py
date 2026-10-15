@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict
+from typing import Dict, Optional
 
 
 class VariableResolver:
@@ -34,6 +34,6 @@ class VariableResolver:
         """Remove a variable."""
         self.variables.pop(name, None)
 
-    def get(self, name: str, default: str = "") -> str:
+    def get(self, name: str, default: Optional[str] = "") -> Optional[str]:
         """Get a variable value."""
         return self.variables.get(name, default)
