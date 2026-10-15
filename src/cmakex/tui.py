@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import shlex
-import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -28,6 +28,7 @@ from textual.widgets import (
 )
 from textual.widgets.tree import TreeNode
 
+from . import process
 from .builder import Cleaner, build, clean, configure, install, uninstall
 from .fileapi import Reply
 from .inputs import Change, describe_changes
@@ -45,6 +46,10 @@ from .parser.parser import load_cache
 # Cache entry types worth showing; INTERNAL/STATIC are CMake bookkeeping.
 _USER_CACHE_TYPES = ("BOOL", "STRING", "PATH", "FILEPATH", "UNINITIALIZED")
 _MAX_SOURCES = 50
+#: A second ctrl+c within this many seconds quits.
+QUIT_REPEAT_SECONDS = 2.0
+#: Stopping this action midway would leave a partial installation.
+_UNSTOPPABLE = "Install"
 
 NodeData = Tuple[str, Any]
 
@@ -118,7 +123,9 @@ class ProfileScreen(ModalScreen[Optional[Profile]]):
         self.dismiss(None)
 
 
-class CmakexApp(App[None]):
+# Textual's own app bindings are not inherited: its ctrl+q quit is often
+# taken by editors and terminals, so ctrl+c pressed twice quits instead.
+class CmakexApp(App[None], inherit_bindings=False):
     """Browse an analyzed CMake project and run build actions on it."""
 
     TITLE = "cmakex"
@@ -148,6 +155,8 @@ class CmakexApp(App[None]):
         Binding("p", "profile", "Preset"),
         Binding("g", "toggle_log", "Log"),
         Binding("q", "quit", "Quit"),
+        # Not a priority binding: with text selected, ctrl+c still copies it.
+        Binding("ctrl+c", "quit_on_repeat", "Quit", show=False),
     ]
 
     def __init__(self, source_dir: Path, build_dir: Path, watch_interval: float = 1.0):
@@ -159,11 +168,18 @@ class CmakexApp(App[None]):
         self.info: Optional[CMakeInfo] = None
         self._info_profile: Optional[Profile] = None  # Profile self.info came from
         self.busy = False
-        # CMake files changed since self.info was produced, waiting for re-analysis.
+        self._action: Optional[str] = None  # Title of the running action
+        # CMake files changed since self.info was produced. They are only
+        # reported; re-analysis waits for the user (r, or agreeing to it
+        # before an action).
         self._pending: List[Change] = []
         self._pending_key: Optional[tuple] = None
-        # Changes whose re-analysis failed; retried only after further edits.
+        # Changes whose re-analysis failed.
         self._failed_key: Optional[tuple] = None
+        # Action to continue with once the current re-analysis succeeds.
+        self._after_analysis: Optional[Tuple[str, Callable[[], None]]] = None
+        self._detail: Optional[NodeData] = None  # What the details pane shows
+        self._quit_pressed_at: Optional[float] = None
 
     # -- layout -----------------------------------------------------------
 
@@ -248,22 +264,25 @@ class CmakexApp(App[None]):
 
     def _analysis_failed(self, message: str) -> None:
         self.busy = False
+        follow_up, self._after_analysis = self._after_analysis, None
+        cancelled = f" {follow_up[0]} cancelled." if follow_up else ""
         self._set_loading(False)
         self._log(Text(f"Error: {message}", style="bold red"))
         if self.info is not None and self._pending:
             self._failed_key = self._pending_key
             self.notify(
                 "CMake configure failed; still showing the previous analysis. "
-                "Fix the CMake files and save to retry (see the log).",
+                f"Fix the CMake files and press r to retry (see the log).{cancelled}",
                 title="Re-analysis failed",
                 severity="error",
             )
         else:
-            self.notify(message, title="Analysis failed", severity="error")
+            self.notify(message + cancelled, title="Analysis failed", severity="error")
         self._update_subtitle()
 
     def _show_info(self, info: CMakeInfo, profile: Optional[Profile]) -> None:
         self.busy = False
+        follow_up, self._after_analysis = self._after_analysis, None
         self.info = info
         self._info_profile = profile
         startup_changes = info.changes and not self._pending
@@ -282,6 +301,12 @@ class CmakexApp(App[None]):
                 title="Analysis updated",
             )
         self._populate_tree(info)
+        if follow_up is not None:
+            title, then = follow_up
+            if info.backend == "file-api":
+                then()
+            else:
+                self.notify(f"{title} cancelled: CMake configure failed.", severity="error")
 
     def _update_subtitle(self, activity: str = "") -> None:
         info = self.info
@@ -299,7 +324,7 @@ class CmakexApp(App[None]):
         if self._pending and self._failed_key == self._pending_key:
             parts.append("⚠ configure failed")
         elif self._pending:
-            parts.append(f"⚠ {_plural(len(self._pending), 'file')} changed")
+            parts.append(f"⚠ {_plural(len(self._pending), 'file')} changed, press r to re-analyze")
         if activity:
             parts.append(activity)
         self.sub_title = " · ".join(parts)
@@ -330,29 +355,31 @@ class CmakexApp(App[None]):
     ) -> None:
         if info is not self.info or self.busy:
             return  # Outdated result
-        if changes:
-            key = tuple((str(c.path), c.md5) for c in changes)
-            if key == self._failed_key:
-                return  # Already failed for exactly these contents
-            if key != self._pending_key:
-                # Wait one more check so an editor can finish saving.
-                if not self._pending:
-                    message = describe_changes(changes, self.source_dir)
-                    self._log(Text(message, style="yellow"))
-                    self.notify(f"{message}. Re-analyzing…", title="CMake files changed")
-                self._pending, self._pending_key = changes, key
-                self._update_subtitle()
-                self._refresh_detail()
-                return
-            self.action_analyze()
-        elif self._pending:
-            # The edits were reverted.
-            self._pending, self._pending_key, self._failed_key = [], None, None
-            self._update_subtitle()
-            self._refresh_detail()
-        elif reconfigured:
+        if self._update_pending(changes):
+            self.notify(
+                f"{describe_changes(changes, self.source_dir)}. Press r to re-analyze.",
+                title="Analysis out of date",
+                severity="warning",
+            )
+        elif reconfigured and not changes:
+            # CMake already did the work; this only reads its fresh output.
             self._log(Text("CMake was re-run outside cmakex; reloading.", style="yellow"))
             self.action_analyze()
+
+    def _update_pending(self, changes: List[Change]) -> bool:
+        """Record the files changed since the analysis; True if newly out of date."""
+        key = tuple((str(c.path), c.md5) for c in changes) or None
+        if key == self._pending_key:
+            return False
+        newly = bool(changes) and not self._pending
+        if newly:
+            self._log(Text(describe_changes(changes, self.source_dir), style="yellow"))
+        self._pending, self._pending_key = changes, key
+        if not changes:
+            self._failed_key = None  # The edits were reverted
+        self._update_subtitle()
+        self._refresh_detail()
+        return newly
 
     @staticmethod
     def _node_key(node: Optional[TreeNode]) -> Optional[tuple]:
@@ -427,6 +454,7 @@ class CmakexApp(App[None]):
             self._show_detail(event.node.data)
 
     def _show_detail(self, data: NodeData) -> None:
+        self._detail = data
         kind, obj = data
         renderers: dict = {
             "overview": self._render_overview,
@@ -438,10 +466,10 @@ class CmakexApp(App[None]):
         self.query_one("#detail", Static).update(renderers[kind](obj))
 
     def _refresh_detail(self) -> None:
-        """Re-render the details of the selected node."""
-        nav = self.query_one("#nav", Tree)
-        if nav.cursor_node is not None and nav.cursor_node.data is not None:
-            self._show_detail(nav.cursor_node.data)
+        """Re-render the details pane, e.g. after the analysis went stale."""
+        # Not the tree's cursor node: there is none until the user moves it.
+        if self._detail is not None:
+            self._show_detail(self._detail)
 
     def _render_overview(self, info: CMakeInfo) -> Any:
         rows: List[Tuple[str, Any]] = [
@@ -459,7 +487,7 @@ class CmakexApp(App[None]):
         if self._pending and self._failed_key == self._pending_key:
             status = Text("configure failed for the current changes (see log)", style="red")
         elif self._pending:
-            status = Text("CMake files changed, re-analyzing…", style="yellow")
+            status = Text("out of date, CMake files changed (press r)", style="yellow")
         else:
             status = Text("up to date", style="green")
         rows.append(("Analysis", status))
@@ -552,16 +580,21 @@ class CmakexApp(App[None]):
     def _run_command(self, cmd: List[str]) -> int:
         """Runner for builder operations: streams output into the log."""
         self.call_from_thread(self._log, Text(f"$ {shlex.join(cmd)}", style="bold"))
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
+        proc = process.spawn(cmd)
         assert proc.stdout is not None
-        for line in proc.stdout:
-            self.call_from_thread(self._log, line.rstrip())
-        return proc.wait()
+        try:
+            for line in proc.stdout:
+                self.call_from_thread(self._log, line.rstrip())
+        finally:
+            rc = process.finish(proc)
+        return rc
+
+    def _run_action(self, title: str, action: Callable[[], int], reanalyze: bool) -> None:
+        self._action = title
+        self._action_worker(title, action, reanalyze)
 
     @work(thread=True, exclusive=True, group="action")
-    def _run_action(self, title: str, action: Callable[[], int], reanalyze: bool) -> None:
+    def _action_worker(self, title: str, action: Callable[[], int], reanalyze: bool) -> None:
         try:
             rc = action()
         except (OSError, ValueError) as exc:
@@ -571,6 +604,7 @@ class CmakexApp(App[None]):
 
     def _action_done(self, title: str, rc: int, reanalyze: bool) -> None:
         self.busy = False
+        self._action = None
         if rc == 0:
             self.notify(f"{title} finished.")
         else:
@@ -588,6 +622,38 @@ class CmakexApp(App[None]):
             severity="warning",
         )
         return False
+
+    def _when_current(self, title: str, then: Callable[[], None]) -> None:
+        """Run *then* if the analysis matches the CMake files on disk.
+
+        Otherwise the user must agree to re-analyze first; *then* runs after
+        a successful re-analysis, and declining cancels it.
+        """
+        if self.busy:
+            self.notify("Another operation is still running.", severity="warning")
+            return
+        inputs = self.info.inputs if self.info is not None else None
+        # Check now rather than trusting the watcher, which may not have run
+        # since the last edit.
+        self._update_pending(inputs.changes() if inputs is not None else [])
+        if not self._pending:
+            then()
+            return
+
+        def answered(ok: Optional[bool]) -> None:
+            if not ok:
+                self.notify(f"{title} cancelled: the analysis is out of date.",
+                            severity="warning")
+                return
+            self._after_analysis = (title, then)
+            self.action_analyze()
+
+        body = (
+            f"{describe_changes(self._pending, self.source_dir)}.\n\n"
+            f"The analysis no longer matches the project. Re-analyze now and "
+            f"then continue? No cancels the {title.lower()}."
+        )
+        self.push_screen(ConfirmScreen(f"{title}: re-analyze first?", body), answered)
 
     def action_configure(self) -> None:
         if not self._claim():
@@ -609,14 +675,20 @@ class CmakexApp(App[None]):
         )
 
     def action_build(self) -> None:
-        if self._require_configured() and self._claim():
+        if self._require_configured():
+            self._when_current("Build", self._build)
+
+    def _build(self) -> None:
+        if self._claim():
             self._run_action(
                 "Build", lambda: build(self.build_dir, runner=self._run_command), False
             )
 
     def action_clean(self) -> None:
-        if not self._require_configured():
-            return
+        if self._require_configured():
+            self._when_current("Clean", self._clean)
+
+    def _clean(self) -> None:
         targets = Cleaner(self.build_dir).get_clean_targets()
         installed = len(targets.installed_dirs) + len(targets.installed_files)
         body = f"Run the clean target in '{_display(self.build_dir)}' ({targets.total_file_count} files)."
@@ -636,8 +708,11 @@ class CmakexApp(App[None]):
         self.push_screen(ConfirmScreen("Clean build artifacts?", body), confirmed)
 
     def action_install(self) -> None:
-        if not self._require_configured():
-            return
+        if self._require_configured():
+            self._when_current("Install", self._install)
+
+    def _install(self) -> None:
+        # Read after any re-analysis: the prefix may have changed.
         prefix = load_cache(self.build_dir).get("CMAKE_INSTALL_PREFIX", "?")
 
         def confirmed(ok: Optional[bool]) -> None:
@@ -664,6 +739,52 @@ class CmakexApp(App[None]):
                 self.action_analyze()
 
         self.push_screen(ProfileScreen(available_profiles(self.source_dir, self.build_dir)), chosen)
+
+    def _activity(self) -> Optional[str]:
+        """What is running, e.g. "build" or "analysis"; None if idle."""
+        if self._action is not None:
+            return self._action.lower()
+        return "analysis" if self.busy else None
+
+    def _refuse_quit(self) -> bool:
+        """Notify and return True if quitting now would do harm."""
+        if self._action != _UNSTOPPABLE:
+            return False
+        self.notify(
+            f"{_UNSTOPPABLE} is still running; stopping it now would leave a "
+            "partial installation. Quit once it has finished.",
+            severity="warning",
+        )
+        return True
+
+    async def action_quit(self) -> None:
+        # A single key should not kill a long build: that takes Ctrl+C twice.
+        running = self._activity()
+        if running is None:
+            self.exit()
+        elif not self._refuse_quit():
+            self.notify(
+                f"The {running} is still running; press Ctrl+C twice to stop it and quit.",
+                severity="warning",
+            )
+
+    def action_quit_on_repeat(self) -> None:
+        if self._refuse_quit():
+            self._quit_pressed_at = None
+            return
+        now = time.monotonic()
+        if (
+            self._quit_pressed_at is not None
+            and now - self._quit_pressed_at <= QUIT_REPEAT_SECONDS
+        ):
+            # Otherwise exiting waits for CMake, which can take a whole build.
+            process.stop_all()
+            self.exit()
+            return
+        self._quit_pressed_at = now
+        running = self._activity()
+        what = f"stop the {running} and quit" if running else "quit"
+        self.notify(f"Press Ctrl+C again to {what}.", timeout=QUIT_REPEAT_SECONDS)
 
     def action_toggle_log(self) -> None:
         log = self.query_one("#log", RichLog)
