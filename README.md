@@ -25,7 +25,7 @@ pip install cmakex
 Or install from source:
 
 ```bash
-git clone https://github.com/winterYANGWT/cmakex.git
+git clone https://github.com/Raricor/cmakex.git
 cd cmakex
 pip install -e .
 ```
@@ -78,19 +78,30 @@ On startup cmakex analyzes the project (see [Analysis](#analysis)), then shows:
 | `r` | Re-analyze |
 | `p` | Choose what to analyze: the configured build directory, a configure preset, or the default configuration |
 | `g` | Show/hide the log |
-| `q` | Quit |
+| `q`, or `Ctrl+C` twice within 2 s | Quit |
+
+`Ctrl+Q` does nothing, so it stays free for editors and terminals that use
+it. With text selected, `Ctrl+C` copies it instead.
+
+While a configure, build, clean or analysis is running, `q` only shows a
+hint; pressing `Ctrl+C` twice stops it, including make/ninja and the
+compilers it started, and quits. An install is never stopped midway, since
+that would leave a partial installation: quit once it has finished.
 
 Command output is streamed into the log panel. When stdin/stdout is not a
 terminal, `cmakex` prints its help instead.
 
 While the UI is open, cmakex watches the project's CMake files (see
 [Change detection](#change-detection)). When one changes, the header shows
-how many files changed and the project is re-analyzed automatically a moment
-later; the selected item stays selected. If that configure fails, typically
-because a `CMakeLists.txt` is half-edited, the previous results stay on
-screen with "configure failed" in the header, and cmakex retries once the
-file is saved again. Running `cmake` on the build directory outside cmakex
-also triggers a reload.
+how many files changed and the details list them, but nothing is re-analyzed
+until you press `r`; the selected item then stays selected. Build, clean and
+install check the files again before they start: if the analysis is out of
+date they ask to re-analyze first, continue once that succeeds, and are
+cancelled if you decline or the re-analysis fails. If configure fails,
+typically because a `CMakeLists.txt` is half-edited, the previous results
+stay on screen with "configure failed" in the header. Running `cmake` on the
+build directory outside cmakex reloads its fresh results without asking,
+since CMake has already done the configure.
 
 ## Analysis
 
