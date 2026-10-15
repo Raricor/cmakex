@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence, Union
 
 import click
 
 from .builder import Cleaner, build, clean, configure, install, purge, uninstall
-from .parser import parse_cmake_file
+from .introspect import (
+    BACKENDS,
+    IntrospectError,
+    Profile,
+    describe_backend,
+    inspect_project,
+)
+from .models import ExecutableInfo, LibraryInfo
 
 CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
 
@@ -19,12 +26,15 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
 # ---------------------------------------------------------------------------
 
 
-@click.group(context_settings=CONTEXT_SETTINGS)
+@click.group(context_settings=CONTEXT_SETTINGS, invoke_without_command=True)
 @click.version_option(package_name="cmakex")
-def cli() -> None:
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """cmakex — CMake build eXtension.
 
     Wraps common CMake workflows and provides project introspection.
+    Run without a command to open the interactive interface (same as
+    'cmakex ui').
 
     \b
     Typical workflow:
@@ -33,6 +43,11 @@ def cli() -> None:
       cmakex build -B build -j8
       cmakex clean -B build
     """
+    if ctx.invoked_subcommand is None:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            click.echo(ctx.get_help())
+            return
+        ctx.invoke(cmd_ui)
 
 
 # ---------------------------------------------------------------------------
@@ -66,26 +81,77 @@ def _require_cmake_file(source_dir: str) -> Path:
     "--build-dir",
     default="build",
     show_default=True,
-    help="Build directory (used for display when output dir is not set).",
+    help="Build directory to read CMake File API data from.",
 )
-def cmd_info(source_dir: str, build_dir: str) -> None:
+@click.option(
+    "--backend",
+    type=click.Choice(BACKENDS),
+    default="auto",
+    show_default=True,
+    help="Where to get project information: the CMake File API, static "
+    "CMakeLists.txt parsing, or the File API with a static fallback.",
+)
+@click.option(
+    "--config",
+    default=None,
+    help="Configuration to show for multi-config generators (File API only).",
+)
+@click.option(
+    "--preset",
+    default=None,
+    help="Analyze with this configure preset instead of the build directory.",
+)
+def cmd_info(
+    source_dir: str,
+    build_dir: str,
+    backend: str,
+    config: Optional[str],
+    preset: Optional[str],
+) -> None:
     """Show include directories and library/executable output paths.
 
-    Parses CMakeLists.txt in the source directory (and any subdirectories
-    added via add_subdirectory) to extract:
+    Results come from the CMake File API (CMake >= 3.14), so if() branches,
+    functions and find_package() are evaluated exactly as CMake does:
 
     \b
+      - a configured BUILD_DIR is read directly (refreshed if CMake files
+        changed);
+      - otherwise cmakex configures a private analysis tree in
+        BUILD_DIR/.cmakex/ using the first configure preset, or CMake
+        defaults (Debug) without presets. Nothing is compiled.
+
+    If configure fails (e.g. a missing dependency), falls back to parsing
+    CMakeLists.txt, which is best-effort.
+
+    \b
+    Lists:
       - Include directories
       - Shared libraries (.so)
       - Static libraries (.a)
       - Executables
     """
     cmake_file = _require_cmake_file(source_dir)
-    info = parse_cmake_file(cmake_file)
+
+    def note(message: str) -> None:
+        click.echo(click.style("Note: ", fg="yellow") + message, err=True)
+
+    try:
+        info = inspect_project(
+            cmake_file.parent,
+            Path(build_dir),
+            backend,
+            config,
+            Profile("preset", preset) if preset else None,
+            note,
+        )
+    except (IntrospectError, ValueError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
 
     root_dir = cmake_file.parent.resolve()
-
     click.echo(f"Source : {root_dir}")
+    click.echo(f"Build  : {info.build_dir}")
+    click.echo(f"Backend: {describe_backend(info)}")
     click.echo()
 
     # Include directories
@@ -97,58 +163,40 @@ def cmd_info(source_dir: str, build_dir: str) -> None:
         click.echo("  (none detected)")
     click.echo()
 
-    # Shared libraries
-    click.echo(click.style("Shared Libraries (.so):", bold=True))
-    if info.shared_libs:
-        for lib in info.shared_libs:
-            out = lib.output_dir or f"{build_dir}"
-            src_info = ""
-            if lib.source_dir and lib.source_dir != root_dir:
-                rel_path = (
-                    lib.source_dir.relative_to(root_dir)
-                    if lib.source_dir.is_relative_to(root_dir)
-                    else lib.source_dir
-                )
-                src_info = f"  [{rel_path}]"
-            click.echo(f"  {lib.name:<30}  {out}/{lib.filename()}{src_info}")
-    else:
-        click.echo("  (none detected)")
+    _echo_targets("Shared Libraries (.so):", info.shared_libs, root_dir)
     click.echo()
-
-    # Static libraries
-    click.echo(click.style("Static Libraries (.a):", bold=True))
-    if info.static_libs:
-        for lib in info.static_libs:
-            out = lib.output_dir or f"{build_dir}"
-            src_info = ""
-            if lib.source_dir and lib.source_dir != root_dir:
-                rel_path = (
-                    lib.source_dir.relative_to(root_dir)
-                    if lib.source_dir.is_relative_to(root_dir)
-                    else lib.source_dir
-                )
-                src_info = f"  [{rel_path}]"
-            click.echo(f"  {lib.name:<30}  {out}/{lib.filename()}{src_info}")
-    else:
-        click.echo("  (none detected)")
+    _echo_targets("Static Libraries (.a):", info.static_libs, root_dir)
     click.echo()
+    _echo_targets("Executables:", info.executables, root_dir)
 
-    # Executables
-    click.echo(click.style("Executables:", bold=True))
-    if info.executables:
-        for exe in info.executables:
-            out = exe.output_dir or f"{build_dir}"
-            src_info = ""
-            if exe.source_dir and exe.source_dir != root_dir:
-                rel_path = (
-                    exe.source_dir.relative_to(root_dir)
-                    if exe.source_dir.is_relative_to(root_dir)
-                    else exe.source_dir
-                )
-                src_info = f"  [{rel_path}]"
-            click.echo(f"  {exe.name:<30}  {out}/{exe.filename()}{src_info}")
-    else:
+
+def _relative_to(path: Path, base: Path) -> Optional[Path]:
+    try:
+        return path.relative_to(base)
+    except ValueError:
+        return None
+
+
+def _echo_targets(
+    title: str,
+    targets: Sequence[Union[LibraryInfo, ExecutableInfo]],
+    root_dir: Path,
+) -> None:
+    click.echo(click.style(title, bold=True))
+    if not targets:
         click.echo("  (none detected)")
+        return
+
+    cwd = Path.cwd()
+    for t in targets:
+        if t.artifact is None:
+            out = t.filename()
+        else:
+            out = str(_relative_to(t.artifact, cwd) or t.artifact)
+        src_info = ""
+        if t.source_dir and t.source_dir != root_dir:
+            src_info = f"  [{_relative_to(t.source_dir, root_dir) or t.source_dir}]"
+        click.echo(f"  {t.name:<30}  {out}{src_info}")
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +233,11 @@ def cmd_info(source_dir: str, build_dir: str) -> None:
     metavar="KEY=VALUE",
     help="Set a CMake cache variable (repeatable).",
 )
+@click.option(
+    "--preset",
+    default=None,
+    help="Use this configure preset (its binaryDir is replaced by -B).",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Print the cmake command.")
 @click.argument("extra", nargs=-1)
 def cmd_configure(
@@ -192,6 +245,7 @@ def cmd_configure(
     build_dir: str,
     generator: Optional[str],
     defines: tuple,
+    preset: Optional[str],
     verbose: bool,
     extra: tuple,
 ) -> None:
@@ -203,6 +257,7 @@ def cmd_configure(
     Examples:
       cmakex configure
       cmakex configure -B build -G Ninja -D CMAKE_BUILD_TYPE=Release
+      cmakex configure --preset release
       cmakex configure -- -DCMAKE_VERBOSE_MAKEFILE=ON
     """
     source = Path(source_dir).resolve()
@@ -210,7 +265,8 @@ def cmd_configure(
         click.echo(f"Error: CMakeLists.txt not found in '{source}'", err=True)
         sys.exit(1)
 
-    cmake_args = [f"-D{d}" for d in defines]
+    cmake_args = ["--preset", preset] if preset else []
+    cmake_args += [f"-D{d}" for d in defines]
     cmake_args += list(extra)
 
     try:
@@ -583,3 +639,37 @@ def cmd_install(
         sys.exit(1)
 
     sys.exit(rc)
+
+
+# ---------------------------------------------------------------------------
+# ui
+# ---------------------------------------------------------------------------
+
+
+@cli.command("ui")
+@click.option(
+    "-S",
+    "--source-dir",
+    default=".",
+    show_default=True,
+    help="Source directory containing CMakeLists.txt.",
+)
+@click.option(
+    "-B",
+    "--build-dir",
+    default="build",
+    show_default=True,
+    help="Build directory that configure/build/clean/install act on.",
+)
+def cmd_ui(source_dir: str, build_dir: str) -> None:
+    """Open the interactive interface.
+
+    Analyzes the project on startup (see 'cmakex info') and lets you browse
+    targets, include directories, cache options and compilers, and run
+    configure/build/clean/install on BUILD_DIR.
+    """
+    cmake_file = _require_cmake_file(source_dir)
+    # Imported lazily: Textual is only needed for the interactive interface.
+    from .tui import CmakexApp
+
+    CmakexApp(cmake_file.parent.resolve(), Path(build_dir)).run()
